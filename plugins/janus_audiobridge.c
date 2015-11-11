@@ -1695,12 +1695,7 @@ static void *janus_audiobridge_handler(void *data) {
 			usleep(50000);
 			continue;
 		}
-		janus_audiobridge_session *session = NULL;
-		janus_mutex_lock(&sessions_mutex);
-		if(g_hash_table_lookup(sessions, msg->handle) != NULL ) {
-			session = (janus_audiobridge_session *)msg->handle->plugin_handle;
-		}
-		janus_mutex_unlock(&sessions_mutex);
+		janus_audiobridge_session *session = (janus_audiobridge_session *)msg->handle->plugin_handle;	
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			janus_audiobridge_message_free(msg);
@@ -2645,7 +2640,13 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 		for(i=0; i<samples; i++)
 			buffer[i] = 0;
 		GList *ps = participants_list;
+
+		//(Ke Shen) number of participants
+		int participantNumber = 0;
+
 		while(ps) {
+			participantNumber++;
+
 			janus_audiobridge_participant *p = (janus_audiobridge_participant *)ps->data;
 			janus_mutex_lock(&p->qmutex);
 			if(!p->active || p->muted || p->prebuffering || !p->inbuf) {
@@ -2660,7 +2661,7 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 				for(i=0; i<samples; i++)
 					buffer[i] += curBuffer[i];
 			}
-			janus_mutex_unlock(&p->qmutex);
+			janus_mutex_u nlock(&p->qmutex);
 			ps = ps->next;
 		}
 		/* Are we recording the mix? (only do it if there's someone in, though...) */
@@ -2671,9 +2672,54 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			}
 			fwrite(outBuffer, sizeof(opus_int16), samples, audiobridge->recording);
 		}
+
+		//TODO(Ke Shen) find the top k strongest buffers
+		int participantCounter = 0;
+		int topKofAll = 2; // select the top k buffers
+		int *heapofIdx, *heapofVal, *stateofAll;
+		heapofIdx = (int *) malloc(sizeof(int) * topKofAll); // min-heap, sync-up with heapofVal
+		heapofVal = (int *) malloc(sizeof(int) * topKofAll); // min-heap
+		stateofAll = (int *) malloc(sizeof(int) * participantNumber);
+		memset(heapofIdx, 0, sizeof(int) * topKofAll);
+		memset(heapofVal, 0, sizeof(int) * topKofAll);
+		memset(stateofAll, 0, sizeof(int) * participantNumber);
+		ps = participants_list;
+		for(participantCounter = 0; ps; participantCounter++) {
+			janus_audiobridge_participant *p = (janus_audiobridge_participant *)ps->data;
+			janus_mutex_lock(&p->qmutex);
+			if(!p->active || p->muted || p->prebuffering || !p->inbuf) {
+				janus_mutex_unlock(&p->qmutex);
+				ps = ps->next;
+				//TODO(Ke Shen) set its state:
+				//
+				continue;
+			}
+			GList *peek = g_list_first(p->inbuf);
+			janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)(peek ? peek->data : NULL);
+			if(pkt != NULL) {
+				curBuffer = (opus_int16 *)pkt->data;
+				//TODO(Ke Shen) calculate its value (the audio strength):
+				int curBufferVal = 0;
+				for(i = 0; i < samples; i++) {
+					//TODO
+				}
+				//TODO(Ke Shen) if its value is smaller than the head of heapofVal, set its state to 1;
+				// else, add (participantCounter, curBufferVal) to (heapofIdx, heapofVal),
+				// and set the old head's state to 1:
+			}
+			janus_mutex_unlock(&p->qmutex);
+			ps = ps->next;
+		}
+		for(participantCounter = 0; participantCounter < participantNumber; participantCounter++) {
+			if(stateofAll[participantCounter]) continue;
+			for(i = 0; i < samples; i++)
+				//TODO(Ke Shen) add curBuffer to buffer:
+				//
+		}
+
 		/* Send proper packet to each participant (remove own contribution) */
 		ps = participants_list;
-		while(ps) {
+		for(participantCounter = 0; ps; participantCounter++) {
 			janus_audiobridge_participant *p = (janus_audiobridge_participant *)ps->data;
 			janus_audiobridge_rtp_relay_packet *pkt = NULL;
 			janus_mutex_lock(&p->qmutex);
@@ -2684,8 +2730,15 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			}
 			janus_mutex_unlock(&p->qmutex);
 			curBuffer = (opus_int16 *)(pkt ? pkt->data : NULL);
-			for(i=0; i<samples; i++)
-				sumBuffer[i] = buffer[i] - (curBuffer ? (curBuffer[i]) : 0);
+
+			int removeOwn = stateofAll[participantCounter] ? 0 : 1;// if remove own contribution
+			if(removeOwn) {
+				for(i=0; i<samples; i++)
+					sumBuffer[i] = buffer[i] - (curBuffer ? (curBuffer[i]) : 0);
+			} else {
+				for(i=0; i<samples; i++) sumBuffer[i] = buffer[i];
+			}
+
 			for(i=0; i<samples; i++)
 				/* FIXME Smoothen/Normalize instead of truncating? */
 				outBuffer[i] = sumBuffer[i];
