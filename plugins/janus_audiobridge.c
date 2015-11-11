@@ -389,6 +389,11 @@ record_file =	/path/to/recording.wav (where to save the recording)
 #define JANUS_AUDIOBRIDGE_AUTHOR			"Meetecho s.r.l."
 #define JANUS_AUDIOBRIDGE_PACKAGE			"janus.plugin.audiobridge"
 
+/* for Binary Heap */
+#define LCHILD(x) 2 * x + 1
+#define RCHILD(x) 2 * x + 2
+#define PARENT(x) x / 2
+
 /* Plugin methods */
 janus_plugin *create(void);
 int janus_audiobridge_init(janus_callbacks *callback, const char *config_path);
@@ -458,6 +463,71 @@ typedef struct janus_audiobridge_message {
 	char *sdp;
 } janus_audiobridge_message;
 static GAsyncQueue *messages = NULL;
+
+//<!--
+typedef struct janus_audiobridge_buffer_ranker {
+	int id;
+	opus_int32 data;
+	opus_int16 *buffer;
+} janus_audiobridge_buffer_ranker;
+typedef struct janus_audiobridge_buffer_minheap {
+    int size;
+    int count;
+    janus_audiobridge_buffer_ranker *elem;
+} janus_audiobridge_buffer_minheap;
+void janus_audiobridge_buffer_ranker_init(janus_audiobridge_buffer_ranker * br,int _id, opus_int32 _bufferStrength, opus_int16 *_buffer);
+void janus_audiobridge_buffer_minheap_init(janus_audiobridge_buffer_minheap *hp, int size);
+void janus_audiobridge_buffer_minheap_insert(janus_audiobridge_buffer_minheap *hp, int _id, opus_int32 _bufferStrength, opus_int16 *_buffer);
+void janus_audiobridge_buffer_minheap_swap(janus_audiobridge_buffer_ranker *n1, janus_audiobridge_buffer_ranker *n2);
+void janus_audiobridge_buffer_minheap_heapify(janus_audiobridge_buffer_minheap *hp, int i);
+void janus_audiobridge_buffer_minheap_free(janus_audiobridge_buffer_minheap *hp);
+void janus_audiobridge_buffer_ranker_init(janus_audiobridge_buffer_ranker * br,int _id, opus_int32 _bufferStrength, opus_int16 *_buffer) {
+	br->id = _id;
+	br->data = _bufferStrength;
+	br->buffer = _buffer;
+}
+void janus_audiobridge_buffer_minheap_init(janus_audiobridge_buffer_minheap *hp, int size) {
+	if(size <= 0) return;
+    hp->size = size;
+    hp->count = 0;
+    hp->elem = (janus_audiobridge_buffer_ranker *) malloc(sizeof(janus_audiobridge_buffer_ranker) * size);
+}
+void janus_audiobridge_buffer_minheap_insert(janus_audiobridge_buffer_minheap *hp, int _id, opus_int32 _bufferStrength, opus_int16 *_buffer) {
+	if(hp->count == hp->size) {
+		if(_bufferStrength <= hp->elem[0].data) return;
+		janus_audiobridge_buffer_ranker_init(&(hp->elem[0]), _id, _bufferStrength, _buffer);
+		janus_audiobridge_buffer_minheap_heapify(hp, 0);
+		return;
+	}
+
+    // fix up
+    int i = hp->count;
+    while(i && _bufferStrength < hp->elem[PARENT(i)].data) {
+        hp->elem[i] = hp->elem[PARENT(i)] ;
+        i = PARENT(i) ;
+    }
+	janus_audiobridge_buffer_ranker_init(&(hp->elem[i]), _id, _bufferStrength, _buffer);
+    hp->count++;
+}
+void janus_audiobridge_buffer_minheap_swap(janus_audiobridge_buffer_ranker *n1, janus_audiobridge_buffer_ranker *n2) {
+    janus_audiobridge_buffer_ranker temp = *n1;
+    *n1 = *n2;
+    *n2 = temp;
+}
+void janus_audiobridge_buffer_minheap_heapify(janus_audiobridge_buffer_minheap *hp, int i) { // fix down
+    int smallest = (LCHILD(i) < hp->size && hp->elem[LCHILD(i)].data < hp->elem[i].data) ? LCHILD(i) : i;
+    if(RCHILD(i) < hp->size && hp->elem[RCHILD(i)].data < hp->elem[smallest].data) {
+        smallest = RCHILD(i);
+    }
+    if(smallest != i) {
+        janus_audiobridge_buffer_minheap_swap(&(hp->elem[i]), &(hp->elem[smallest]));
+        janus_audiobridge_buffer_minheap_heapify(hp, smallest);
+    }
+}
+void janus_audiobridge_buffer_minheap_free(janus_audiobridge_buffer_minheap *hp) {
+	free(hp->elem);
+}
+//-->
 
 void janus_audiobridge_message_free(janus_audiobridge_message *msg);
 void janus_audiobridge_message_free(janus_audiobridge_message *msg) {
@@ -1695,7 +1765,12 @@ static void *janus_audiobridge_handler(void *data) {
 			usleep(50000);
 			continue;
 		}
-		janus_audiobridge_session *session = (janus_audiobridge_session *)msg->handle->plugin_handle;	
+		janus_audiobridge_session *session = NULL;
+		janus_mutex_lock(&sessions_mutex);
+		if(g_hash_table_lookup(sessions, msg->handle) != NULL ) {
+			session = (janus_audiobridge_session *)msg->handle->plugin_handle;
+		}
+		janus_mutex_unlock(&sessions_mutex);
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			janus_audiobridge_message_free(msg);
@@ -2641,12 +2716,16 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			buffer[i] = 0;
 		GList *ps = participants_list;
 
-		//(Ke Shen) number of participants
-		int participantNumber = 0;
-
-		while(ps) {
-			participantNumber++;
-
+		//<!-- find the top k strongest buffers
+		int participantCounter = 0, participantNumber = g_list_length(participants_list);
+		int topKofAll = participantNumber, _topKofAllInit = 2; // set k
+		if(topKofAll > _topKofAllInit) topKofAll = _topKofAllInit;
+		janus_audiobridge_buffer_minheap heapofBuffers; // a min-heap
+		janus_audiobridge_buffer_minheap_init(&heapofBuffers, topKofAll);
+		// for participant[i], stateofAll[i] is if its buffer is added to outBuffer
+		int *stateofAll = malloc(sizeof(int) * participantNumber);
+		memset(stateofAll, 0, sizeof(int) * participantNumber);
+		for(ps = participants_list, participantCounter = 0; ps; participantCounter++) {
 			janus_audiobridge_participant *p = (janus_audiobridge_participant *)ps->data;
 			janus_mutex_lock(&p->qmutex);
 			if(!p->active || p->muted || p->prebuffering || !p->inbuf) {
@@ -2658,12 +2737,26 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)(peek ? peek->data : NULL);
 			if(pkt != NULL) {
 				curBuffer = (opus_int16 *)pkt->data;
-				for(i=0; i<samples; i++)
-					buffer[i] += curBuffer[i];
+				// calculate its strength value:
+				opus_int32 _curBufferStrength = 0;
+				for(i = 0; i < samples; i++) {
+					_curBufferStrength += curBuffer[i];
+				}
+				// now we get (participantCounter, _curBufferStrength, curBuffer).
+				janus_audiobridge_buffer_minheap_insert(&heapofBuffers, participantCounter, _curBufferStrength, curBuffer);
 			}
-			janus_mutex_u nlock(&p->qmutex);
+			janus_mutex_unlock(&p->qmutex);
 			ps = ps->next;
 		}
+		for(participantCounter = 0; participantCounter < heapofBuffers.count; participantCounter++) {
+			stateofAll[heapofBuffers.elem[participantCounter].id] = 1;
+			curBuffer = heapofBuffers.elem[participantCounter].buffer;
+			for(i = 0; i < samples; i++)
+				buffer[i] += curBuffer[i];
+		}
+		janus_audiobridge_buffer_minheap_free(&heapofBuffers);
+		//-->
+
 		/* Are we recording the mix? (only do it if there's someone in, though...) */
 		if(audiobridge->recording != NULL && g_list_length(participants_list) > 0) {
 			for(i=0; i<samples; i++) {
@@ -2673,53 +2766,8 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			fwrite(outBuffer, sizeof(opus_int16), samples, audiobridge->recording);
 		}
 
-		//TODO(Ke Shen) find the top k strongest buffers
-		int participantCounter = 0;
-		int topKofAll = 2; // select the top k buffers
-		int *heapofIdx, *heapofVal, *stateofAll;
-		heapofIdx = (int *) malloc(sizeof(int) * topKofAll); // min-heap, sync-up with heapofVal
-		heapofVal = (int *) malloc(sizeof(int) * topKofAll); // min-heap
-		stateofAll = (int *) malloc(sizeof(int) * participantNumber);
-		memset(heapofIdx, 0, sizeof(int) * topKofAll);
-		memset(heapofVal, 0, sizeof(int) * topKofAll);
-		memset(stateofAll, 0, sizeof(int) * participantNumber);
-		ps = participants_list;
-		for(participantCounter = 0; ps; participantCounter++) {
-			janus_audiobridge_participant *p = (janus_audiobridge_participant *)ps->data;
-			janus_mutex_lock(&p->qmutex);
-			if(!p->active || p->muted || p->prebuffering || !p->inbuf) {
-				janus_mutex_unlock(&p->qmutex);
-				ps = ps->next;
-				//TODO(Ke Shen) set its state:
-				//
-				continue;
-			}
-			GList *peek = g_list_first(p->inbuf);
-			janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)(peek ? peek->data : NULL);
-			if(pkt != NULL) {
-				curBuffer = (opus_int16 *)pkt->data;
-				//TODO(Ke Shen) calculate its value (the audio strength):
-				int curBufferVal = 0;
-				for(i = 0; i < samples; i++) {
-					//TODO
-				}
-				//TODO(Ke Shen) if its value is smaller than the head of heapofVal, set its state to 1;
-				// else, add (participantCounter, curBufferVal) to (heapofIdx, heapofVal),
-				// and set the old head's state to 1:
-			}
-			janus_mutex_unlock(&p->qmutex);
-			ps = ps->next;
-		}
-		for(participantCounter = 0; participantCounter < participantNumber; participantCounter++) {
-			if(stateofAll[participantCounter]) continue;
-			for(i = 0; i < samples; i++)
-				//TODO(Ke Shen) add curBuffer to buffer:
-				//
-		}
-
 		/* Send proper packet to each participant (remove own contribution) */
-		ps = participants_list;
-		for(participantCounter = 0; ps; participantCounter++) {
+		for(ps = participants_list, participantCounter = 0; ps; participantCounter++) {
 			janus_audiobridge_participant *p = (janus_audiobridge_participant *)ps->data;
 			janus_audiobridge_rtp_relay_packet *pkt = NULL;
 			janus_mutex_lock(&p->qmutex);
@@ -2731,13 +2779,14 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			janus_mutex_unlock(&p->qmutex);
 			curBuffer = (opus_int16 *)(pkt ? pkt->data : NULL);
 
-			int removeOwn = stateofAll[participantCounter] ? 0 : 1;// if remove own contribution
-			if(removeOwn) {
-				for(i=0; i<samples; i++)
-					sumBuffer[i] = buffer[i] - (curBuffer ? (curBuffer[i]) : 0);
+			//<!-- see if remove own contribution
+			if(stateofAll[participantCounter] && curBuffer) {
+				for(i = 0; i < samples; i++)
+					sumBuffer[i] = buffer[i] - curBuffer[i];
 			} else {
-				for(i=0; i<samples; i++) sumBuffer[i] = buffer[i];
+				for(i = 0; i < samples; i++) sumBuffer[i] = buffer[i];
 			}
+			//-->
 
 			for(i=0; i<samples; i++)
 				/* FIXME Smoothen/Normalize instead of truncating? */
@@ -2767,6 +2816,11 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			}
 			ps = ps->next;
 		}
+
+		//<!--
+		free(stateofAll);
+		//-->
+
 		g_list_free(participants_list);
 	}
 	if(audiobridge->recording)
