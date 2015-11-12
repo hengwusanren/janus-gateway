@@ -596,7 +596,8 @@ opus_int32 janus_audiobridge_buffer_energy(opus_int16 *_buffer, int _length, int
     opus_int32 energy = 0;
     *scale_factor = WebRtcSpl_GetScalingSquare(_buffer, _length, _length);
 
-    for (int i = 0, opus_int16 *p = _buffer; i < _length; i++) {
+    opus_int16 *p = _buffer;
+    for (int i = 0; i < _length; i++) {
         energy += (*p * *p) >> (*scale_factor);
         p++;
     }
