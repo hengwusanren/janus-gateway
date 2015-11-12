@@ -2718,7 +2718,7 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 
 		//<!-- find the top k strongest buffers
 		int participantCounter = 0, participantNumber = g_list_length(participants_list);
-		int topKofAll = participantNumber, _topKofAllInit = 2; // set k
+		int topKofAll = participantNumber, _topKofAllInit = 3; // set k
 		if(topKofAll > _topKofAllInit) topKofAll = _topKofAllInit;
 		janus_audiobridge_buffer_minheap heapofBuffers; // a min-heap
 		janus_audiobridge_buffer_minheap_init(&heapofBuffers, topKofAll);
